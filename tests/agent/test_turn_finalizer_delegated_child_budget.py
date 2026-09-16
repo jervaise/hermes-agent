@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.delegation_context import delegated_child_context
+from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
 from agent.turn_finalizer import _resolve_budget_fallback
 
 
@@ -43,9 +43,13 @@ def _call(agent):
         return recorder
 
 
-def test_delegated_child_does_not_record_parent_task_outcome():
+@pytest.mark.parametrize("scope", [delegated_child_context, non_dispatcher_owned_context])
+def test_non_owner_scope_does_not_record_parent_task_outcome(scope):
+    """Neither an in-process delegate child nor a cron run fired beside the worker owns the
+    task the inherited env names; recording ``timed_out`` there would release the worker's
+    claim and burn its consecutive-failure budget."""
     agent = _agent()
-    with delegated_child_context():
+    with scope():
         recorder = _call(agent)
     recorder.assert_not_called()
 
