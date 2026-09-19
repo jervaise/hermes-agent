@@ -676,6 +676,9 @@ class HindsightMemoryProvider(MemoryProvider):
         # Status channel for the retain indicator (recall reports via recall_status()).
         if callable(kwargs.get("status_callback")):
             self._status_callback = kwargs["status_callback"]
+        # Gated presentation for automatic startup warnings (agent._emit_warning on CLI).
+        self._warning_callback = kwargs.get("warning_callback") if callable(kwargs.get("warning_callback")) else None
+        self._platform = str(kwargs.get("platform") or "cli")
         # session_id stays in tags so processes for one session remain filterable together.
         self._document_id = _mint_document_id(self._session_id)
         _maybe_upgrade_client()
@@ -810,11 +813,18 @@ class HindsightMemoryProvider(MemoryProvider):
                    "memory daemon. Run Hermes as a non-root user, or switch "
                    "to cloud / local_external mode via 'hermes memory setup'.")
             logger.warning(msg)
-            # Also print: otherwise the user would only see Hermes get sluggish.
+            # Surface to the terminal too — a daemon that never starts would otherwise fail silently and
+            # the user would only see Hermes get sluggish (issue #13125). This is an automatic
+            # startup diagnostic: it goes through the agent's gated warning sink when wired,
+            # otherwise through the shared render boundary; the log line above never does.
             with contextlib.suppress(Exception):
-                # Surface to the terminal too — a daemon that never starts would otherwise fail silently and
-                # the user would only see Hermes get sluggish. (issue #13125)
-                print(f"  ⚠ {msg}", file=sys.stderr, flush=True)
+                cb = getattr(self, "_warning_callback", None)
+                if cb is not None:
+                    cb(msg)
+                else:
+                    from gateway.warning_notifications import render_notification
+                    render_notification(lambda: print(f"  ⚠ {msg}", file=sys.stderr, flush=True),
+                                        platform=getattr(self, "_platform", "cli"))
             self._mode = "disabled"
             return
         spawn_context_thread(self._daemon_start_worker, name="hindsight-daemon-start").start()
@@ -1090,11 +1100,15 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _tool_retain(self, args: dict) -> str:
         content, context = args["content"], args.get("context")
+        # Deliberate saves coalesce into the session's one document (session-scoped id +
+        # append on capable APIs), mirroring sync_turn — otherwise every call mints a fresh
+        # server-side UUID document and one session litters the bank per turn.
+        document_id, update_mode = self._resolve_retain_target(self._document_id)
         item = self._build_retain_kwargs(content, context=context, tags=args.get("tags"),
-                                         occurred_at=args.get("occurred_at"))
-        logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
-                     self._bank_id, len(content), context)
-        self._retain_batch(item, bank_id=self._bank_id)
+                                         occurred_at=args.get("occurred_at"), update_mode=update_mode)
+        logger.debug("Tool hindsight_retain: bank=%s, doc=%s, mode=%s, content_len=%d, context=%s",
+                     self._bank_id, document_id, update_mode, len(content), context)
+        self._retain_batch(item, bank_id=self._bank_id, document_id=document_id)
         logger.debug("Tool hindsight_retain: success")
         return "Memory stored successfully."
 

@@ -5,6 +5,7 @@ prefetch (auto_recall, preamble, query truncation), sync_turn (auto_retain,
 turn counting, tags), and schema completeness.
 """
 
+import importlib.util
 import json
 import os
 import re
@@ -14,7 +15,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
@@ -60,6 +61,30 @@ def _clean_env(tmp_path, monkeypatch):
     # Patch the actual API and keep all legacy profile writes in tmp_path.
     isolated_home = tmp_path / "user-home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: isolated_home))
+
+    # These tests provide client doubles, so they must not attempt a network
+    # install merely because the optional SDK is absent from the test env.
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
+
+    # The retain-operation path imports this exception solely to classify a
+    # fake client's response. Supply the smallest matching SDK surface so the
+    # mocked tests remain runnable without the optional Hindsight extra.
+    # Only when the real SDK is absent: shadowing an installed SDK with a
+    # fake (no ``__path__``) breaks ``import hindsight_client`` and turns the
+    # pinned-client test into a permanent skip.
+    if importlib.util.find_spec("hindsight_client_api") is not None:
+        return
+    client_api = ModuleType("hindsight_client_api")
+    exceptions = ModuleType("hindsight_client_api.exceptions")
+
+    class NotFoundException(Exception):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args)
+
+    exceptions.NotFoundException = NotFoundException
+    client_api.exceptions = exceptions
+    monkeypatch.setitem(sys.modules, "hindsight_client_api", client_api)
+    monkeypatch.setitem(sys.modules, "hindsight_client_api.exceptions", exceptions)
 
 
 def _make_mock_client():
@@ -782,7 +807,11 @@ class TestPrefetchServerRetainVisibility:
 
     def test_operation_notfound_treated_as_complete(self, provider):
         """A NotFound (completed+evicted) op is treated as done, not pending."""
-        from hindsight_client_api.exceptions import NotFoundException
+        exceptions = pytest.importorskip(
+            "hindsight_client_api.exceptions",
+            reason="Hindsight SDK is not installed",
+        )
+        NotFoundException = exceptions.NotFoundException
 
         client = _make_mock_client()
         client.operations = MagicMock()
@@ -1293,6 +1322,37 @@ class TestUpdateModeAppendCapability:
         # Flush goes to the OLD session's stable doc, not new-sid's.
         assert kw["document_id"] == "test-session"
         assert kw["items"][0]["update_mode"] == "append"
+
+    def test_deliberate_tool_retain_coalesces_into_session_document(self, provider, monkeypatch):
+        """hindsight_retain (deliberate save) must land in the session's one stable
+        document with append — one document per session, not one UUID per call."""
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        json.loads(provider.handle_tool_call("hindsight_retain", {"content": "picked branch A"}))
+        json.loads(provider.handle_tool_call("hindsight_retain", {"content": "picked branch B"}))
+
+        assert provider._client.aretain_batch.call_count == 2
+        first, second = (c.kwargs for c in provider._client.aretain_batch.call_args_list)
+        # Both deliberate saves land in the SAME session-scoped document.
+        assert first["document_id"] == "test-session" == second["document_id"]
+        assert first["items"][0]["update_mode"] == "append"
+        assert second["items"][0]["update_mode"] == "append"
+
+    def test_deliberate_tool_retain_legacy_api_falls_back_to_per_process_doc(self, provider, monkeypatch):
+        """Legacy API — the tool keeps the per-process doc id and passes no update_mode."""
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: None,
+        )
+        json.loads(provider.handle_tool_call("hindsight_retain", {"content": "picked branch A"}))
+
+        kw = provider._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"].startswith("test-session-")
+        assert "update_mode" not in kw["items"][0]
 
 
 # ---------------------------------------------------------------------------
