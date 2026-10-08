@@ -75,6 +75,25 @@ def test_sample_memory_has_expected_keys_on_linux() -> None:
     assert "mem_available_kib" in sample
 
 
+def test_sample_memory_reads_psutil_on_windows(monkeypatch) -> None:
+    """Windows has no /proc: without a psutil branch every heartbeat carried no ``mem``, so an
+    unclean death logged ``last_mem=None suspected_oom=False``."""
+    from types import SimpleNamespace
+
+    import psutil
+
+    gib = 1024 ** 3
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(total=64 * gib, available=32 * gib))
+    monkeypatch.setattr(psutil, "swap_memory", lambda: SimpleNamespace(used=2 * gib))
+    monkeypatch.setattr(psutil, "Process", lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=gib)))
+    monkeypatch.setattr("gateway.lifecycle_ledger._windows_commit_kib", dict)
+    sample = sample_memory()
+    assert sample == {"rss_kib": 1024 ** 2, "mem_total_kib": 64 * 1024 ** 2,
+                      "mem_available_kib": 32 * 1024 ** 2, "swap_used_kib": 2 * 1024 ** 2}
+    assert all(type(v) is int for v in sample.values())
+
+
 # ---------------------------------------------------------------------------
 # First boot / clean lifecycle
 # ---------------------------------------------------------------------------
@@ -175,6 +194,19 @@ def test_record_startup_carries_unclean_flags_onto_new_sentinel(
     assert sentinel["phase"] == "running"
     assert sentinel["prior_unclean_exit"] is True
     assert sentinel["prior_suspected_oom"] is True
+
+
+def test_commit_near_limit_is_suspected_oom(tmp_path: Path) -> None:
+    """Windows runs out of commit, not free RAM (8 Oct 2026: plenty available, commit exhausted)."""
+    gib_kib = 1024 ** 2
+    _write_sentinel(tmp_path, {"phase": "running", "pid": _DEAD_PID, "start_time": 1000.0})
+    for commit_fraction, expected in ((0.95, True), (0.50, False)):
+        _write_heartbeat(tmp_path, {"pid": _DEAD_PID, "mem": {
+            "mem_total_kib": 64 * gib_kib, "mem_available_kib": 32 * gib_kib,
+            "commit_total_kib": int(100 * gib_kib * commit_fraction), "commit_limit_kib": 100 * gib_kib}})
+        evidence = detect_unclean_exit(home=tmp_path)
+        assert evidence is not None
+        assert evidence.get("suspected_oom", False) is expected
 
 
 def test_record_startup_clean_boot_has_no_prior_flags(tmp_path: Path) -> None:

@@ -1835,8 +1835,8 @@ def _system_memory_sample() -> dict:
 def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
     """Memory-derived default for ``kanban.max_in_progress`` when unset:
     ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``. Returns
-    ``None`` (no cap) when total memory is unknown, so macOS/Windows dev
-    machines are unaffected.
+    ``None`` (no cap) when total memory is unknown (e.g. macOS, where
+    ``sample_memory`` returns ``{}``).
     """
     if sample is None:
         sample = _system_memory_sample()
