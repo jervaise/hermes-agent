@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import time
 from contextlib import closing
 from datetime import datetime, timezone
@@ -22,6 +23,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+# Windows commit charge / commit limit above which an unclean death reads as a suspected OOM.
+_SUSPECTED_OOM_COMMIT_FRACTION = 0.92
 
 
 def _process_hermes_home() -> Path:
@@ -61,9 +65,52 @@ def _proc_fields(path: str, wanted: dict[str, str]) -> dict[str, int]:
     return found
 
 
+def _windows_commit_kib() -> dict[str, int]:
+    """System commit charge and limit (KiB) from ``GetPerformanceInfo``; ``{}`` on failure.
+    Windows dies when commit, not free RAM, runs out, so this is the OOM signal there."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PerfInfo(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD)] + [
+                (name, ctypes.c_size_t) for name in (
+                    "CommitTotal", "CommitLimit", "CommitPeak", "PhysicalTotal", "PhysicalAvailable",
+                    "SystemCache", "KernelTotal", "KernelPaged", "KernelNonpaged", "PageSize")
+            ] + [(name, wintypes.DWORD) for name in ("HandleCount", "ProcessCount", "ThreadCount")]
+
+        info = _PerfInfo()
+        info.cb = ctypes.sizeof(info)
+        if not ctypes.WinDLL("psapi").GetPerformanceInfo(ctypes.byref(info), info.cb):
+            return {}
+        return {"commit_total_kib": info.CommitTotal * info.PageSize // 1024,
+                "commit_limit_kib": info.CommitLimit * info.PageSize // 1024}
+    except Exception:
+        return {}
+
+
+def _windows_memory() -> dict[str, Any]:
+    """psutil snapshot in the /proc keys (KiB) plus system commit; ``{}`` on failure."""
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        sample: dict[str, Any] = {
+            "rss_kib": psutil.Process().memory_info().rss // 1024, "mem_total_kib": vm.total // 1024,
+            "mem_available_kib": vm.available // 1024, "swap_used_kib": psutil.swap_memory().used // 1024,
+        }
+    except Exception:
+        return {}
+    sample.update(_windows_commit_kib())
+    return sample
+
+
 def sample_memory() -> dict[str, Any]:
-    """Cheap /proc snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used.  Linux-only
-    (``{}`` elsewhere), never raises; the 30s heartbeat embeds it so OOM cycles are classifiable."""
+    """Cheap snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used, from /proc on Linux and
+    psutil (+ commit charge/limit) on Windows; ``{}`` elsewhere or on failure, never raises.  The
+    30s heartbeat embeds it so OOM cycles are classifiable."""
+    if sys.platform == "win32":
+        return _windows_memory()
     sample = _proc_fields("/proc/self/status", {"VmRSS": "rss_kib"})
     mem = _proc_fields("/proc/meminfo", {"MemTotal": "mem_total_kib", "MemAvailable": "mem_available_kib",
                                          "SwapTotal": "SwapTotal", "SwapFree": "SwapFree"})
@@ -142,9 +189,13 @@ def _pid_is_sentinel_owner(pid: Any, start_time: Any, create_time: Any) -> bool:
 
 def _suspected_oom(mem: dict[str, Any]) -> bool:
     """Heuristic only (classification stays with the reader); thresholds are
-    memory_status' "critical" tier so a live warning and a post-mortem verdict agree."""
+    memory_status' "critical" tier so a live warning and a post-mortem verdict agree.  On Windows a
+    commit charge above ``_SUSPECTED_OOM_COMMIT_FRACTION`` of the limit also counts."""
     from gateway.memory_status import _CRITICAL_AVAILABLE_FRACTION, _CRITICAL_AVAILABLE_KIB
 
+    commit, limit = mem.get("commit_total_kib"), mem.get("commit_limit_kib")
+    if isinstance(commit, int) and isinstance(limit, int) and limit > 0 and commit / limit > _SUSPECTED_OOM_COMMIT_FRACTION:
+        return True
     total, avail = mem.get("mem_total_kib"), mem.get("mem_available_kib")
     if not isinstance(avail, int):
         return False
